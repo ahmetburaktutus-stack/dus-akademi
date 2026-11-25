@@ -39,7 +39,7 @@ jobs:
           chmod +x gradlew
           # Maven sunucusu geçici "429 Too Many Requests" verirse 3 kez yeniden dene
           for attempt in 1 2 3; do
-            ./gradlew assembleDebug --no-daemon && break
+            ./gradlew assembleDebug --no-daemon --init-script ci-mirror.init.gradle && break
             if [ "$attempt" = 3 ]; then exit 1; fi
             echo "Derleme başarısız, $((attempt * 30)) sn sonra tekrar deneniyor..."
             sleep $((attempt * 30))

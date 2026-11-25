@@ -1,0 +1,17 @@
+// CI derlemelerinde Maven Central yerine önce Google'ın resmi Maven Central yansısını kullanır.
+// repo.maven.apache.org, GitHub Actions sunucularına sık sık "429 Too Many Requests" veriyor.
+// Bu dosya tüm modüllere (Capacitor eklentileri dahil) uygulanır; yansıda olmayan bir şey
+// olursa projenin kendi google() / mavenCentral() depolarına geri düşülür.
+
+def centralMirror = 'https://maven-central.storage-download.googleapis.com/maven2/'
+
+allprojects {
+    buildscript {
+        repositories {
+            maven { url centralMirror }
+        }
+    }
+    repositories {
+        maven { url centralMirror }
+    }
+}
