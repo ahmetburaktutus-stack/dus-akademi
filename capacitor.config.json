@@ -1,0 +1,6 @@
+{
+  "appId": "com.ahmetburak.dusakademi",
+  "appName": "DUS Akademi",
+  "webDir": "dist",
+  "android": { "allowMixedContent": false }
+}
