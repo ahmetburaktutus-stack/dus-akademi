@@ -53,7 +53,7 @@ import {
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
-import { Share } from '@capacitor/share';
+import { Share as CapacitorShare } from '@capacitor/share';
 
 // ============================================================================
 // 1. VERİ MODELLERİ VE SABİTLER (TEXTBOOK EŞLEŞTİRME MOTORU)
@@ -328,6 +328,9 @@ interface DUSQuestion {
   attemptsCount?: number;
   correctCount?: number;
   auditResult?: AuditResult;
+  // Aralıklı tekrar (Yanlışlar defteri)
+  reviewStage?: number; // kaç vadeli tekrar doğru geçildi (0-4)
+  nextReviewAt?: string; // bir sonraki tekrarın ISO tarihi
 }
 
 interface ExamAttemptSession {
@@ -575,6 +578,195 @@ async function copyToClipboardSafe(text: string): Promise<boolean> {
  * Ücretsiz Gemini, ChatGPT veya Claude web sohbetlerine yapıştırılmak üzere
  * dersin kanonik textbook referanslarını içeren ÖSYM DUS soru üretim komutu oluşturur.
  */
+// ============================================================================
+// SORU KALİTE MOTORU: Şık dengeleme, doğrulama, dağılım ve tekrar önleme
+// ============================================================================
+
+const OPTION_KEYS: OptionKey[] = ['A', 'B', 'C', 'D', 'E'];
+
+// Aralıklı tekrar: yanlış yapılan soru 1, 3, 7 ve 21 gün sonra tekrar sorulur.
+// 4 vadeli tekrarın hepsi doğru yapılınca soru Yanlışlar defterinden çıkar.
+const REVIEW_INTERVAL_DAYS = [1, 3, 7, 21];
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function isReviewDue(q: { isWrongPreviously?: boolean; nextReviewAt?: string }, now = Date.now()): boolean {
+  if (!q.isWrongPreviously) return false;
+  if (!q.nextReviewAt) return true; // eski sürümden kalan yanlışlar hemen tekrar edilebilir
+  const t = Date.parse(q.nextReviewAt);
+  return Number.isNaN(t) || t <= now;
+}
+
+function describeNextReview(q: { nextReviewAt?: string }, now = Date.now()): string {
+  if (!q.nextReviewAt) return 'Tekrar zamanı geldi';
+  const diff = Date.parse(q.nextReviewAt) - now;
+  if (Number.isNaN(diff) || diff <= 0) return 'Tekrar zamanı geldi';
+  const days = Math.ceil(diff / DAY_MS);
+  return days <= 1 ? 'Tekrar: yarın' : `Tekrar: ${days} gün sonra`;
+}
+
+function shuffleArray<T>(arr: T[]): T[] {
+  const copy = [...arr];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
+function parseCorrectLetter(raw: unknown): OptionKey | null {
+  const letter = String(raw ?? '').trim().toUpperCase().charAt(0) as OptionKey;
+  return OPTION_KEYS.includes(letter) ? letter : null;
+}
+
+const ROMAN_NUMERALS = ['I', 'II', 'III', 'IV', 'V'];
+
+/** "Yalnız I", "I ve II", "I, II ve III" gibi öncül şıklarını sayı listesine çevirir. */
+function premiseOptionKey(text: string): number[] | null {
+  const tokens = text.replace(/[.,;:]/g, ' ').split(/\s+/).filter(Boolean);
+  const nums: number[] = [];
+  for (const t of tokens) {
+    const idx = ROMAN_NUMERALS.indexOf(t);
+    if (idx >= 0) nums.push(idx + 1);
+    else if (!/^(yalnız|yalniz|sadece|ve|ile)$/i.test(t)) return null;
+  }
+  return nums.length ? nums : null;
+}
+
+function comparePremiseKeys(a: number[], b: number[]): number {
+  if (a.length !== b.length) return a.length - b.length;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return 0;
+}
+
+/** Açıklamalardaki "B şıkkı", "(C)", "doğru cevap D" gibi harf atıflarını yeni şık sırasına çevirir. */
+function remapLetterReferences(text: string, map: Record<OptionKey, OptionKey>): string {
+  if (!text) return text;
+  return text.replace(
+    /\(([A-E])\)|\b([A-E])(?=\s*(?:şıkk|şık|seçene))|((?:[Cc]evap|[Yy]anıt|[Şş]ık|[Ss]eçenek)\s*:?\s*)([A-E])\b/g,
+    (match, paren?: string, before?: string, prefix?: string, after?: string) => {
+      if (paren) return `(${map[paren as OptionKey]})`;
+      if (before) return map[before as OptionKey];
+      if (prefix && after) return prefix + map[after as OptionKey];
+      return match;
+    }
+  );
+}
+
+/**
+ * Dil modelleri doğru cevabı belirli harflere (çoğunlukla B ve C) yığma eğilimindedir.
+ * Normal sorularda şıklar rastgele karıştırılır; öncüllü sorularda ÖSYM'nin kanonik
+ * sırasına dizilir (Yalnız I, Yalnız II, I ve II, ... I, II ve III). Doğru cevap ve
+ * çeldirici açıklamaları yeni sıraya göre yeniden eşlenir.
+ */
+function rebalanceQuestionOptions<
+  T extends {
+    options: QuestionOptions;
+    correctAnswer: OptionKey;
+    distractorExplanations: DistractorExplanations;
+    mechanismExplanation: string;
+    premises?: string[];
+  }
+>(q: T): T {
+  let order: OptionKey[]; // order[yeniPozisyon] = eskiHarf
+  const premiseKeys =
+    q.premises && q.premises.length > 0 ? OPTION_KEYS.map((k) => premiseOptionKey(q.options[k])) : null;
+
+  if (premiseKeys && premiseKeys.every((k) => k !== null)) {
+    order = [...OPTION_KEYS].sort((a, b) =>
+      comparePremiseKeys(premiseKeys[OPTION_KEYS.indexOf(a)]!, premiseKeys[OPTION_KEYS.indexOf(b)]!)
+    );
+  } else {
+    order = shuffleArray(OPTION_KEYS);
+  }
+
+  const oldToNew = {} as Record<OptionKey, OptionKey>;
+  order.forEach((oldKey, newIdx) => {
+    oldToNew[oldKey] = OPTION_KEYS[newIdx];
+  });
+
+  const options = {} as QuestionOptions;
+  const distractorExplanations = {} as DistractorExplanations;
+  order.forEach((oldKey, newIdx) => {
+    const newKey = OPTION_KEYS[newIdx];
+    options[newKey] = q.options[oldKey];
+    distractorExplanations[newKey] = remapLetterReferences(q.distractorExplanations[oldKey] || '', oldToNew);
+  });
+
+  return {
+    ...q,
+    options,
+    distractorExplanations,
+    correctAnswer: oldToNew[q.correctAnswer],
+    mechanismExplanation: remapLetterReferences(q.mechanismExplanation, oldToNew)
+  };
+}
+
+/** Kök boş, şık eksik veya aynı şık iki kez yazılmışsa soru havuza alınmaz. */
+function isQuestionStructurallyValid(q: { stem: string; options: QuestionOptions }): boolean {
+  if (!q.stem || q.stem.trim().length < 15) return false;
+  const texts = OPTION_KEYS.map((k) => (q.options[k] || '').trim().toLocaleLowerCase('tr'));
+  if (texts.some((t) => !t)) return false;
+  return new Set(texts).size === OPTION_KEYS.length;
+}
+
+/**
+ * Karma deneme için ders dağılımını modele bırakmak yerine uygulama belirler:
+ * gerçek DUS'taki oran gibi soruların yaklaşık 1/3'ü Temel, 2/3'ü Klinik Bilimler.
+ * Her kategori içinde dersler eşit (rastgele başlangıçlı) dağıtılır, sınavdaki gibi
+ * önce Temel sonra Klinik dersler gruplanır.
+ */
+function buildKarmaSubjectPlan(count: number): string[] {
+  const temel = shuffleArray(SUBJECTS.filter((s) => s.category === 'Temel Bilimler'));
+  const klinik = shuffleArray(SUBJECTS.filter((s) => s.category === 'Klinik Bilimler'));
+  const temelCount = Math.max(1, Math.round(count / 3));
+  const klinikCount = Math.max(0, count - temelCount);
+
+  const plan: string[] = [];
+  for (let i = 0; i < temelCount; i++) plan.push(temel[i % temel.length].id);
+  for (let i = 0; i < klinikCount; i++) plan.push(klinik[i % klinik.length].id);
+
+  const orderIndex = (id: string) => SUBJECTS.findIndex((s) => s.id === id);
+  return plan.sort((a, b) => orderIndex(a) - orderIndex(b));
+}
+
+function describeSubjectPlan(plan: string[]): string {
+  return plan
+    .map((id, i) => `${i + 1}. soru: ${SUBJECTS.find((s) => s.id === id)?.name || id}`)
+    .join('\n');
+}
+
+/** Havuzdaki mevcut sorulardan, tekrar üretilmemesi gereken soru köklerinin kısa özetleri. */
+function collectAvoidStems(
+  bank: { subjectId: string; subtopic?: string; stem: string; createdAt: string }[],
+  subjectIds: string[],
+  subtopic: string,
+  limit = 25
+): string[] {
+  const sub = subtopic.trim().toLocaleLowerCase('tr');
+  const relevant = bank.filter((q) => subjectIds.includes(q.subjectId));
+  const focused = sub
+    ? relevant.filter((q) => (q.subtopic || '').toLocaleLowerCase('tr').includes(sub))
+    : relevant;
+  const source = focused.length > 0 ? focused : relevant;
+  return [...source]
+    .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
+    .slice(0, limit)
+    .map((q) => q.stem.replace(/\s+/g, ' ').trim().slice(0, 110));
+}
+
+function buildAvoidBlock(avoidStems?: string[]): string {
+  if (!avoidStems || avoidStems.length === 0) return '';
+  return `\n\nDAHA ÖNCE ÜRETİLMİŞ SORULAR (TEKRARLAMA):
+Aşağıdaki sorular kullanıcının havuzunda zaten var. Aynı bilgiyi aynı açıdan ölçen, bunların benzeri veya yeniden yazılmışı olan soru ÜRETME; aynı konuda farklı kazanımları, farklı klinik senaryoları ve farklı ayırt edici noktaları sorgula:
+${avoidStems.map((s) => `- ${s}…`).join('\n')}`;
+}
+
+const NO_LETTER_REFERENCE_RULE =
+  'Açıklamalarda (mechanismExplanation ve distractorExplanations) şıklara harfle ("B şıkkı", "doğru cevap C") ATIF YAPMA; şıklar uygulamada yeniden sıralanacaktır. Şıktan içeriğiyle bahset.';
+
+const VISUAL_WITHOUT_IMAGE_RULE =
+  'Kullanıcı görsel EKLEMEDİ. Radyografik/klinik/histolojik bulguları soru kökünde ayrıntılı SÖZEL olarak betimle ("Panoramik radyografide kökün apikal üçlüsünde 1 cm çaplı, sınırları belirgin radyolusent alan izleniyor..."). Kullanıcının göremeyeceği bir görsele ATIF YAPMA: "şekilde", "görselde", "okla gösterilen", "aşağıdaki radyografide" gibi ifadeler YASAK.';
+
 function buildBridgeGenerationPrompt(params: {
   selectedSubjectId: string;
   subtopic: string;
@@ -582,8 +774,21 @@ function buildBridgeGenerationPrompt(params: {
   questionType: string;
   count: number;
   difficulty: string;
+  avoidStems?: string[];
+  subjectPlan?: string[];
+  hasImage?: boolean;
 }): string {
-  const { selectedSubjectId, subtopic, strictSubtopicLock = true, questionType, count, difficulty } = params;
+  const {
+    selectedSubjectId,
+    subtopic,
+    strictSubtopicLock = true,
+    questionType,
+    count,
+    difficulty,
+    avoidStems,
+    subjectPlan,
+    hasImage
+  } = params;
   const isKarmaAll = selectedSubjectId === 'karma_all';
   const targetSubjects = isKarmaAll
     ? SUBJECTS
@@ -598,9 +803,17 @@ function buildBridgeGenerationPrompt(params: {
 
   const visualPromptRule = isVisualQuestionType
     ? `\n🖼️ GÖRSELLİ SORU KURGUSU ZORUNLULUĞU:
-- Kullanıcı "Görselli Soru" formatını seçmiştir. Sohbete bir radyografi, klinik fotoğraf, histolojik kesit veya anatomik şema eklendiyse tüm soruları doğrudan o görseldeki bulgulara dayandır.
-- Eğer sohbete henüz harici bir görsel eklenmediyse bile, her soruda radyografik/klinik/histolojik görünüm bulgularını ("Panoramik radyografide...", "Periapikal filmde...", "Histolojik kesitte...", "Klinik muayene görüntüsünde...") ayrıntılı betimleyen görsel yorumlama soruları kurgula ve "imageCaption" alanına görselin klinik tanımını yaz.`
+${
+        hasImage
+          ? '- Sohbete bir radyografi, klinik fotoğraf, histolojik kesit veya anatomik şema eklenecek. Tüm soruları doğrudan o görseldeki bulgulara dayandır ve "imageCaption" alanına görselin klinik tanımını yaz.'
+          : `- ${VISUAL_WITHOUT_IMAGE_RULE}`
+      }`
     : '';
+
+  const planBlock =
+    isKarmaAll && subjectPlan && subjectPlan.length > 0
+      ? `\n\n📋 SORU-DERS DAĞILIMI (ZORUNLU, BU SIRAYLA):\n${describeSubjectPlan(subjectPlan)}\nHer sorunun "subject" alanına yukarıdaki ders adını birebir yaz.`
+      : '';
 
   const strictScopeBlock = trimmedSubtopic
     ? `
@@ -630,9 +843,9 @@ SINAV PARAMETRELERİ:
   }
 - Soru Kurgusu / Tipi: ${questionType}
 - Zorluk Seviyesi: ${difficulty}
-- İstenen Soru Sayısı: ${count}
+- İstenen Soru Sayısı: ${count}${planBlock}
 ${visualPromptRule}
-${strictSubtopicLock ? strictScopeBlock : ''}
+${strictSubtopicLock ? strictScopeBlock : ''}${buildAvoidBlock(avoidStems)}
 
 ÇİFT KATMANLI ZORUNLU REFERANS MOTORU (TEXTBOOK + ÇIKMIŞ DUS SORULARI):
 1. Kanonik Textbook Referansları (Bilimsel Doğruluk Tabanı):
@@ -649,8 +862,10 @@ KESİN FORMAT VE İÇERİK KURALLARI:
 2. Her soruda A, B, C, D, E olmak üzere tam 5 şık bulunmalıdır.
 3. Eğer soru öncüllü ise "premises" dizisine ["I. ...", "II. ...", "III. ..."] ekle ve soru kökünü ("stem") buna bağla. Öncüllü değilse "premises": [] bırak.
 4. "distractorExplanations" alanında yanlış olan 4 şıkkın her birinin NEDEN yanlış olduğunu bilimsel gerekçesiyle ayrı ayrı açıkla; doğru şık için "Doğru seçenektir." yaz.
+5. Her soruda ÖNCE "mechanismExplanation" ve "distractorExplanations" alanlarını düşünerek yaz, "correctAnswer" alanını EN SON, bu açıklamalarla tutarlı olacak şekilde belirle.
+6. ${NO_LETTER_REFERENCE_RULE}
 
-ÇIKTI JSON ŞEMASI (BİREBİR UYULMALIDIR):
+ÇIKTI JSON ŞEMASI (ALAN SIRASINA BİREBİR UYULMALIDIR):
 {
   "questions": [
     {
@@ -668,16 +883,16 @@ KESİN FORMAT VE İÇERİK KURALLARI:
         "D": "D şıkkı metni",
         "E": "E şıkkı metni"
       },
-      "correctAnswer": "B",
       "textbookReference": "İlgili Textbook Adı, Baskı/Bölüm + İlgili Çıkmış DUS Konsepti",
       "mechanismExplanation": "Doğru cevabın klinik/biyolojik/anatomik mekanizma özeti ve ÖSYM DUS sınavlarında bu bilginin nasıl sorgulandığına dair vurgu...",
       "distractorExplanations": {
-        "A": "A şıkkının neden yanlış olduğunun açıklaması...",
-        "B": "Doğru seçenektir.",
-        "C": "C şıkkının neden yanlış olduğunun açıklaması...",
-        "D": "D şıkkının neden yanlış olduğunun açıklaması...",
-        "E": "E şıkkının neden yanlış olduğunun açıklaması..."
-      }
+        "A": "Bu şıkkın neden yanlış (veya doğru) olduğunun açıklaması...",
+        "B": "...",
+        "C": "...",
+        "D": "...",
+        "E": "..."
+      },
+      "correctAnswer": "Açıklamalarla tutarlı doğru şıkkın harfi (A, B, C, D veya E)"
     }
   ]
 }`;
@@ -695,7 +910,7 @@ function extractAndNormalizeBridgeQuestions(
     questionType: string;
     difficulty: string;
   }
-): DUSQuestion[] {
+): { questions: DUSQuestion[]; dropped: number } {
   const trimmed = rawInput.trim();
   if (!trimmed) {
     throw new Error('Lütfen önce yapay zekanın ürettiği JSON yanıtını kutuya yapıştırın.');
@@ -755,15 +970,15 @@ function extractAndNormalizeBridgeQuestions(
   const nowIso = new Date().toISOString();
   const validLetters: OptionKey[] = ['A', 'B', 'C', 'D', 'E'];
 
-  return rawList.map((item, idx) => {
+  const normalized = rawList.map((item, idx): DUSQuestion | null => {
     if (!item || typeof item !== 'object' || !item.stem || !item.options) {
-      throw new Error(`${idx + 1}. soruda zorunlu alanlar (stem veya options) eksik.`);
+      return null;
     }
 
     const opts = item.options;
     for (const key of validLetters) {
       if (!opts[key] || String(opts[key]).trim() === '') {
-        throw new Error(`${idx + 1}. soruda "${key}" şıkkı eksik.`);
+        return null;
       }
     }
 
@@ -787,11 +1002,9 @@ function extractAndNormalizeBridgeQuestions(
             (lowerSubj.includes('pedodonti') || lowerSubj.includes('çocuk')))
       ) || (isKarmaAll ? SUBJECTS[idx % SUBJECTS.length] : fallbackSubjects[0]);
 
-    const rawCorrect = String(item.correctAnswer || item.correctOption || 'A')
-      .trim()
-      .toUpperCase()
-      .charAt(0) as OptionKey;
-    const correctAnswer: OptionKey = validLetters.includes(rawCorrect) ? rawCorrect : 'A';
+    // Geçersiz cevap harfi artık sessizce "A" yapılmaz; soru havuza alınmaz.
+    const correctAnswer = parseCorrectLetter(item.correctAnswer ?? item.correctOption);
+    if (!correctAnswer) return null;
 
     const premisesList = Array.isArray(item.premises)
       ? item.premises.map((p: any) => String(p).trim()).filter(Boolean)
@@ -799,7 +1012,7 @@ function extractAndNormalizeBridgeQuestions(
 
     const distractors = item.distractorExplanations || item.wrongExplanations || {};
 
-    return {
+    const question: DUSQuestion = {
       id: `dus-bridge-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 7)}`,
       subjectId: matchedSubject.id,
       subject: matchedSubject.name,
@@ -836,7 +1049,19 @@ function extractAndNormalizeBridgeQuestions(
       attemptsCount: 0,
       correctCount: 0
     };
+
+    if (!isQuestionStructurallyValid(question)) return null;
+    return rebalanceQuestionOptions(question);
   });
+
+  const questions = normalized.filter((q): q is DUSQuestion => q !== null);
+  const dropped = normalized.length - questions.length;
+  if (questions.length === 0) {
+    throw new Error(
+      'Yapıştırılan yanıttaki soruların hiçbiri geçerli değil (eksik şık, aynı şık iki kez veya geçersiz doğru cevap). Lütfen yapay zekadan yeniden üretmesini isteyin.'
+    );
+  }
+  return { questions, dropped };
 }
 
 /**
@@ -997,7 +1222,7 @@ async function testGeminiConnection(apiKey: string, model: string): Promise<{ ok
  * OpenAPI responseSchema ile %100 yapılandırılmış DUS soruları üreten fonksiyon.
  * Opsiyonel olarak yüklenen klinik/radyografik görseli multimodal (Vision) olarak analiz eder.
  */
-async function generateQuestionsFromGemini(params: {
+type GeminiGenerationParams = {
   apiKey: string;
   model: string;
   selectedSubjectId: string;
@@ -1007,7 +1232,84 @@ async function generateQuestionsFromGemini(params: {
   count: number;
   difficulty: string;
   referenceImage?: { dataUrl: string; base64Data: string; mimeType: string; caption?: string } | null;
-}): Promise<DUSQuestion[]> {
+};
+
+const MAX_QUESTIONS_PER_REQUEST = 10;
+const MAX_PARALLEL_REQUESTS = 3;
+
+/**
+ * Soruları en fazla 10'arlık istekler halinde (aynı anda en fazla 3 istek) üretir.
+ * Tek dev istek yanıtın yarıda kesilip TÜM soruların kaybolmasına yol açabiliyordu;
+ * artık bir parça başarısız olsa da diğerleri kullanılır.
+ * Karma denemede ders dağılımını uygulama belirler; her parçaya o derslerin daha önce
+ * üretilmiş soru kökleri "tekrarlama" listesi olarak verilir.
+ */
+async function generateQuestionsFromGemini(
+  params: GeminiGenerationParams & {
+    getAvoidStems?: (subjectIds: string[]) => string[];
+  }
+): Promise<{ questions: DUSQuestion[]; dropped: number; failedRequests: number; lastError?: string }> {
+  const { count, selectedSubjectId, getAvoidStems } = params;
+  const isKarmaAll = selectedSubjectId === 'karma_all';
+
+  type Chunk = { count: number; subjectPlan?: string[] };
+  const chunks: Chunk[] = [];
+  if (isKarmaAll) {
+    const plan = buildKarmaSubjectPlan(count);
+    for (let i = 0; i < plan.length; i += MAX_QUESTIONS_PER_REQUEST) {
+      const part = plan.slice(i, i + MAX_QUESTIONS_PER_REQUEST);
+      chunks.push({ count: part.length, subjectPlan: part });
+    }
+  } else {
+    for (let remaining = count; remaining > 0; remaining -= MAX_QUESTIONS_PER_REQUEST) {
+      chunks.push({ count: Math.min(MAX_QUESTIONS_PER_REQUEST, remaining) });
+    }
+  }
+
+  const results: ({ questions: DUSQuestion[]; dropped: number } | Error)[] = new Array(chunks.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < chunks.length) {
+      const i = cursor++;
+      const chunk = chunks[i];
+      const subjectIds = chunk.subjectPlan ? [...new Set(chunk.subjectPlan)] : [selectedSubjectId];
+      try {
+        results[i] = await requestQuestionBatch({
+          ...params,
+          count: chunk.count,
+          subjectPlan: chunk.subjectPlan,
+          avoidStems: getAvoidStems ? getAvoidStems(subjectIds) : []
+        });
+      } catch (err: any) {
+        results[i] = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(MAX_PARALLEL_REQUESTS, chunks.length) }, worker));
+
+  const questions: DUSQuestion[] = [];
+  let dropped = 0;
+  let failedRequests = 0;
+  let lastError: string | undefined;
+  for (const r of results) {
+    if (r instanceof Error) {
+      failedRequests++;
+      lastError = r.message;
+    } else {
+      questions.push(...r.questions);
+      dropped += r.dropped;
+    }
+  }
+
+  if (questions.length === 0) {
+    throw new Error(lastError || 'Hiç geçerli soru üretilemedi. Lütfen tekrar deneyin.');
+  }
+  return { questions, dropped, failedRequests, lastError };
+}
+
+async function requestQuestionBatch(
+  params: GeminiGenerationParams & { subjectPlan?: string[]; avoidStems?: string[] }
+): Promise<{ questions: DUSQuestion[]; dropped: number }> {
   const {
     apiKey,
     model,
@@ -1017,12 +1319,16 @@ async function generateQuestionsFromGemini(params: {
     questionType,
     count,
     difficulty,
-    referenceImage
+    referenceImage,
+    subjectPlan,
+    avoidStems
   } = params;
 
   const isKarmaAll = selectedSubjectId === 'karma_all';
   const targetSubjects = isKarmaAll
-    ? SUBJECTS
+    ? subjectPlan && subjectPlan.length > 0
+      ? SUBJECTS.filter((s) => subjectPlan.includes(s.id))
+      : SUBJECTS
     : SUBJECTS.filter((s) => s.id === selectedSubjectId);
 
   const trimmedSubtopic = subtopic.trim();
@@ -1058,12 +1364,16 @@ KESİN KURALLAR:
 4. Eğer soru tipi "Öncüllü Soru (I, II, III)" ise "premises" dizisine ["I. ...", "II. ...", "III. ..."] şeklinde öncülleri yerleştir ve soru kökünde ("stem") "Yukarıdaki ifadelerden hangileri doğrudur?" şeklinde bağla. Öncüllü değilse "premises" dizisini boş [] bırak.
 5. "textbookReference" alanında hem referans alınan kanonik textbook adını/bölümünü hem de ilişkili çıkmış DUS soru konseptini yaz.
 6. "mechanismExplanation" alanında doğru cevabın klinik/biyolojik/anatomik mekanizmasını ve ÖSYM DUS'ta bu konunun hangi ayırt edici noktadan sorgulandığını net özetle.
-7. "distractorExplanations" nesnesinde A, B, C, D, E şıklarının her biri için açıklama yaz (yanlış olan 4 şıkkın neden yanlış olduğunu madde madde bilimsel gerekçesiyle açıkla; doğru şık için "Doğru seçenektir." yaz).`;
+7. "distractorExplanations" nesnesinde A, B, C, D, E şıklarının her biri için açıklama yaz (yanlış olan 4 şıkkın neden yanlış olduğunu madde madde bilimsel gerekçesiyle açıkla; doğru şık için "Doğru seçenektir." yaz).
+8. Her soruda önce "mechanismExplanation" ve "distractorExplanations" alanlarını yaz; "correctAnswer" alanını EN SON, bu açıklamalarla tutarlı olacak şekilde belirle.
+9. ${NO_LETTER_REFERENCE_RULE}`;
 
   const userPrompt = `Lütfen aşağıdaki parametrelere göre tam ${count} adet özgün DUS sorusu üret:
 - Hedef Ders(ler): ${
     isKarmaAll
-      ? 'Karma DUS Denemesi (Hem Klinik Bilimler hem Temel Bilimler derslerinden dengeli dağılım)'
+      ? subjectPlan && subjectPlan.length > 0
+        ? `Karma DUS Denemesi. Soru-ders dağılımı ZORUNLU olarak şu sırayla (her sorunun "subject" alanına bu ders adını birebir yaz):\n${describeSubjectPlan(subjectPlan)}`
+        : 'Karma DUS Denemesi (Hem Klinik Bilimler hem Temel Bilimler derslerinden dengeli dağılım)'
       : `${targetSubjects[0].name} (${targetSubjects[0].category})`
   }
 - Alt Konu / Odak: ${
@@ -1079,9 +1389,9 @@ KESİN KURALLAR:
           referenceImage.caption ? ` (Görsel Açıklaması: "${referenceImage.caption}")` : ''
         }. Üreteceğin ${count} sorunun TAMAMI doğrudan bu görseldeki anatomik yapıları, radyografik bulguları, patolojiyi veya klinik durumu yorumlatan ÖSYM DUS görsel soruları olmalıdır. Soru kökünde "Şekilde / Radyografide / Klinik fotoğrafta okla veya genel görünümle izlenen..." gibi ifadeler kullan.`
       : isVisualQuestionType
-      ? `\n- GÖRSELLİ SORU KURGUSU ZORUNLULUĞU: Üreteceğin ${count} sorunun TAMAMI radyografik, klinik fotoğraf, histolojik kesit veya anatomik şema bulgularının yorumlanmasına dayalı ÖSYM DUS görsel vaka soruları olmalıdır.`
+      ? `\n- GÖRSEL BULGU YORUMLAMA SORUSU: Üreteceğin ${count} sorunun TAMAMI radyografik, klinik, histolojik veya anatomik bulguların yorumlanmasına dayalı olmalıdır. ${VISUAL_WITHOUT_IMAGE_RULE}`
       : ''
-  }`;
+  }${buildAvoidBlock(avoidStems)}`;
 
   const responseSchema = {
     type: 'OBJECT',
@@ -1091,7 +1401,6 @@ KESİN KURALLAR:
         items: {
           type: 'OBJECT',
           properties: {
-            id: { type: 'STRING' },
             subject: { type: 'STRING' },
             category: { type: 'STRING', enum: ['Klinik Bilimler', 'Temel Bilimler'] },
             subtopic: { type: 'STRING' },
@@ -1113,7 +1422,6 @@ KESİN KURALLAR:
               },
               required: ['A', 'B', 'C', 'D', 'E']
             },
-            correctAnswer: { type: 'STRING', enum: ['A', 'B', 'C', 'D', 'E'] },
             textbookReference: { type: 'STRING' },
             mechanismExplanation: { type: 'STRING' },
             distractorExplanations: {
@@ -1125,11 +1433,27 @@ KESİN KURALLAR:
                 D: { type: 'STRING' },
                 E: { type: 'STRING' }
               },
-              required: ['A', 'B', 'C', 'D', 'E']
-            }
+              required: ['A', 'B', 'C', 'D', 'E'],
+              propertyOrdering: ['A', 'B', 'C', 'D', 'E']
+            },
+            // Cevap harfi, açıklamalar yazıldıktan SONRA üretilir (önce gerekçe, sonra karar)
+            correctAnswer: { type: 'STRING', enum: ['A', 'B', 'C', 'D', 'E'] }
           },
+          propertyOrdering: [
+            'subject',
+            'category',
+            'subtopic',
+            'questionType',
+            'difficulty',
+            'stem',
+            'premises',
+            'options',
+            'textbookReference',
+            'mechanismExplanation',
+            'distractorExplanations',
+            'correctAnswer'
+          ],
           required: [
-            'id',
             'subject',
             'category',
             'subtopic',
@@ -1225,11 +1549,16 @@ KESİN KURALLAR:
   }
 
   const nowIso = new Date().toISOString();
+  const planMatchesOutput = Boolean(subjectPlan && subjectPlan.length === rawList.length);
 
-  return rawList.map((item, idx) => {
+  const normalized = rawList.map((item, idx): DUSQuestion | null => {
     const rawSubjName = String(item.subject || item.subjectName || '').trim();
     const lowerSubj = rawSubjName.toLowerCase();
+    const plannedSubject = planMatchesOutput
+      ? SUBJECTS.find((s) => s.id === subjectPlan![idx])
+      : undefined;
     const matchedSubject =
+      plannedSubject ||
       SUBJECTS.find(
         (s) =>
           s.name.toLowerCase() === lowerSubj ||
@@ -1245,17 +1574,17 @@ KESİN KURALLAR:
               lowerSubj.includes('genetik'))) ||
           (s.id === 'pedodonti' &&
             (lowerSubj.includes('pedodonti') || lowerSubj.includes('çocuk')))
-      ) || (isKarmaAll ? SUBJECTS[idx % SUBJECTS.length] : targetSubjects[0]);
+      ) || (isKarmaAll ? targetSubjects[idx % targetSubjects.length] : targetSubjects[0]);
 
-    const validLetters: OptionKey[] = ['A', 'B', 'C', 'D', 'E'];
-    const rawCorrect = String(item.correctAnswer || 'A').trim().toUpperCase().charAt(0) as OptionKey;
-    const correctAnswer: OptionKey = validLetters.includes(rawCorrect) ? rawCorrect : 'A';
+    // Geçersiz cevap harfi artık sessizce "A" yapılmaz; soru havuza alınmaz.
+    const correctAnswer = parseCorrectLetter(item.correctAnswer);
+    if (!correctAnswer) return null;
 
     const premisesList = Array.isArray(item.premises)
       ? item.premises.map((p: any) => String(p).trim()).filter(Boolean)
       : [];
 
-    return {
+    const question: DUSQuestion = {
       id: `dus-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 7)}`,
       subjectId: matchedSubject.id,
       subject: matchedSubject.name,
@@ -1292,7 +1621,16 @@ KESİN KURALLAR:
       attemptsCount: 0,
       correctCount: 0
     };
+
+    if (!isQuestionStructurallyValid(question)) return null;
+    return rebalanceQuestionOptions(question);
   });
+
+  const questions = normalized.filter((q): q is DUSQuestion => q !== null);
+  if (questions.length === 0) {
+    throw new Error('Model geçerli soru üretmedi (eksik şık veya geçersiz doğru cevap). Lütfen tekrar deneyin.');
+  }
+  return { questions, dropped: normalized.length - questions.length };
 }
 
 /**
@@ -1509,7 +1847,7 @@ export default function App() {
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
 
   // Yanlış Defteri & Kaydedilenler Filtreleri
-  const [notebookFilterType, setNotebookFilterType] = useState<'all' | 'wrong' | 'favorites'>('all');
+  const [notebookFilterType, setNotebookFilterType] = useState<'all' | 'due' | 'wrong' | 'favorites'>('all');
   const [notebookSubjectFilter, setNotebookSubjectFilter] = useState<string>('all');
   const [expandedNotebookIds, setExpandedNotebookIds] = useState<Record<string, boolean>>({});
 
@@ -1758,7 +2096,7 @@ export default function App() {
           directory: Directory.Cache,
           encoding: Encoding.UTF8
         });
-        await Share.share({
+        await CapacitorShare.share({
           title: 'DUS soru havuzu yedeği',
           files: [written.uri],
           dialogTitle: 'Yedeği kaydet veya paylaş'
@@ -1924,7 +2262,7 @@ export default function App() {
 
     setIsGenerating(true);
     try {
-      const generatedQuestions = await generateQuestionsFromGemini({
+      const result = await generateQuestionsFromGemini({
         apiKey,
         model: selectedModel,
         selectedSubjectId,
@@ -1933,8 +2271,14 @@ export default function App() {
         questionType,
         count: questionCount,
         difficulty,
-        referenceImage: attachedReferenceImage
+        referenceImage: attachedReferenceImage,
+        getAvoidStems: (subjectIds) =>
+          collectAvoidStems(questionBank, subjectIds, subtopic, subjectIds.length > 1 ? 30 : 25)
       });
+      const generatedQuestions = result.questions;
+      const notes: string[] = [];
+      if (result.dropped > 0) notes.push(`${result.dropped} hatalı soru elendi`);
+      if (result.failedRequests > 0) notes.push(`bir kısım üretilemedi: ${result.lastError}`);
 
       setQuestionBank((prev) => [...generatedQuestions, ...prev]);
 
@@ -1954,7 +2298,10 @@ export default function App() {
       setElapsedSeconds(0);
       setActiveTab('exam');
       setMobileDrawerOpen(false);
-      showToast('success', `${generatedQuestions.length} adet kanonik DUS sorusu başarıyla üretildi.`);
+      showToast(
+        notes.length > 0 ? 'info' : 'success',
+        `${generatedQuestions.length} adet DUS sorusu üretildi${notes.length > 0 ? ` (${notes.join('; ')})` : ''}.`
+      );
     } catch (err: any) {
       showToast('error', err.message || 'Soru üretilirken bir hata oluştu.');
     } finally {
@@ -1963,18 +2310,33 @@ export default function App() {
   };
 
   // Kopyala-Yapıştır AI Köprüsü: Dinamik Komut Önizlemesi
-  const currentBridgePrompt = useMemo(
-    () =>
-      buildBridgeGenerationPrompt({
-        selectedSubjectId,
-        subtopic,
-        strictSubtopicLock,
-        questionType,
-        count: questionCount,
-        difficulty
-      }),
-    [selectedSubjectId, subtopic, strictSubtopicLock, questionType, questionCount, difficulty]
-  );
+  const currentBridgePrompt = useMemo(() => {
+    const isKarma = selectedSubjectId === 'karma_all';
+    const subjectPlan = isKarma ? buildKarmaSubjectPlan(questionCount) : undefined;
+    const subjectIds = subjectPlan ? [...new Set(subjectPlan)] : [selectedSubjectId];
+    return buildBridgeGenerationPrompt({
+      selectedSubjectId,
+      subtopic,
+      strictSubtopicLock,
+      questionType,
+      count: questionCount,
+      difficulty,
+      subjectPlan,
+      hasImage: Boolean(attachedReferenceImage),
+      avoidStems: collectAvoidStems(questionBank, subjectIds, subtopic, isKarma ? 30 : 25)
+    });
+    // questionBank yalnızca soru sayısı değişince yeniden hesaplansın (her cevapta değil)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    selectedSubjectId,
+    subtopic,
+    strictSubtopicLock,
+    questionType,
+    questionCount,
+    difficulty,
+    attachedReferenceImage,
+    questionBank.length
+  ]);
 
   // Adım 2: Komutu Kopyala
   const handleCopyBridgePrompt = async () => {
@@ -2013,7 +2375,7 @@ export default function App() {
   const handleImportBridgeQuestions = () => {
     setBridgeError(null);
     try {
-      const importedQuestions = extractAndNormalizeBridgeQuestions(bridgeJsonInput, {
+      const { questions: importedQuestions, dropped } = extractAndNormalizeBridgeQuestions(bridgeJsonInput, {
         selectedSubjectId,
         subtopic,
         questionType,
@@ -2040,7 +2402,7 @@ export default function App() {
       setMobileDrawerOpen(false);
       showToast(
         'success',
-        `${importedQuestions.length} adet özgün DUS sorusu başarıyla aktarıldı ve soru havuzunuza kaydedildi!`
+        `${importedQuestions.length} adet özgün DUS sorusu aktarıldı ve soru havuzunuza kaydedildi${dropped > 0 ? ` (${dropped} hatalı soru elendi)` : ''}!`
       );
     } catch (err: any) {
       const msg = err?.message || 'JSON yanıtı işlenemedi.';
@@ -2053,12 +2415,13 @@ export default function App() {
   const handleImportBridgeQuestionsWithImage = () => {
     setBridgeError(null);
     try {
-      const importedQuestions = extractAndNormalizeBridgeQuestions(bridgeJsonInput, {
+      const { questions: rawImported, dropped } = extractAndNormalizeBridgeQuestions(bridgeJsonInput, {
         selectedSubjectId,
         subtopic,
         questionType,
         difficulty
-      }).map((q) =>
+      });
+      const importedQuestions = rawImported.map((q) =>
         attachedReferenceImage
           ? {
               ...q,
@@ -2091,7 +2454,7 @@ export default function App() {
       setMobileDrawerOpen(false);
       showToast(
         'success',
-        `${importedQuestions.length} adet özgün DUS sorusu başarıyla aktarıldı ve soru havuzunuza kaydedildi!`
+        `${importedQuestions.length} adet özgün DUS sorusu aktarıldı ve soru havuzunuza kaydedildi${dropped > 0 ? ` (${dropped} hatalı soru elendi)` : ''}!`
       );
     } catch (err: any) {
       const msg = err?.message || 'JSON yanıtı işlenemedi.';
@@ -2202,12 +2565,40 @@ export default function App() {
     setQuestionBank((prev) =>
       prev.map((q) => {
         if (q.id !== question.id) return q;
-        return {
+        const now = Date.now();
+        const base = {
           ...q,
           lastUserAnswer: chosenOption,
           attemptsCount: (q.attemptsCount || 0) + 1,
-          correctCount: (q.correctCount || 0) + (isCorrect ? 1 : 0),
-          isWrongPreviously: isCorrect ? false : true
+          correctCount: (q.correctCount || 0) + (isCorrect ? 1 : 0)
+        };
+
+        // Yanlış: deftere gir / başa dön, yarın tekrar sorulsun
+        if (!isCorrect) {
+          return {
+            ...base,
+            isWrongPreviously: true,
+            reviewStage: 0,
+            nextReviewAt: new Date(now + REVIEW_INTERVAL_DAYS[0] * DAY_MS).toISOString()
+          };
+        }
+
+        // Defterde olmayan soruyu doğru yapmak hiçbir şeyi değiştirmez
+        if (!q.isWrongPreviously) return base;
+
+        // Vadesi gelmeden doğru yapmak (aynı gün tekrar çözmek) aşama atlatmaz
+        if (!isReviewDue(q, now)) return base;
+
+        const stage = (q.reviewStage || 0) + 1;
+        if (stage >= REVIEW_INTERVAL_DAYS.length) {
+          // 1-3-7-21 gün tekrarlarının hepsi doğru: öğrenildi
+          return { ...base, isWrongPreviously: false, reviewStage: stage, nextReviewAt: undefined };
+        }
+        return {
+          ...base,
+          isWrongPreviously: true,
+          reviewStage: stage,
+          nextReviewAt: new Date(now + REVIEW_INTERVAL_DAYS[stage] * DAY_MS).toISOString()
         };
       })
     );
@@ -2366,10 +2757,13 @@ export default function App() {
   };
 
   const notebookQuestions = useMemo(() => {
-    return questionBank.filter((q) => {
+    const now = Date.now();
+    const filtered = questionBank.filter((q) => {
       const matchesType =
         notebookFilterType === 'all'
           ? q.isWrongPreviously || q.isFavorite
+          : notebookFilterType === 'due'
+          ? isReviewDue(q, now)
           : notebookFilterType === 'wrong'
           ? Boolean(q.isWrongPreviously)
           : Boolean(q.isFavorite);
@@ -2381,6 +2775,10 @@ export default function App() {
 
       return matchesType && matchesSubject;
     });
+    // Tekrar zamanı gelenler en üstte, sonra en yakın tekrar tarihine göre
+    const dueTime = (q: DUSQuestion) =>
+      !q.isWrongPreviously ? Number.MAX_SAFE_INTEGER : isReviewDue(q, now) ? 0 : Date.parse(q.nextReviewAt || '') || 0;
+    return [...filtered].sort((a, b) => dueTime(a) - dueTime(b));
   }, [questionBank, notebookFilterType, notebookSubjectFilter]);
 
   const analyticsData = useMemo(() => {
@@ -2426,6 +2824,7 @@ export default function App() {
     const klinikAccuracy = klinikAttempts > 0 ? Math.round((klinikCorrect / klinikAttempts) * 100) : 0;
     const temelAccuracy = temelAttempts > 0 ? Math.round((temelCorrect / temelAttempts) * 100) : 0;
     const wrongBookCount = questionBank.filter((q) => q.isWrongPreviously).length;
+    const dueReviewCount = questionBank.filter((q) => isReviewDue(q)).length;
     const favoriteCount = questionBank.filter((q) => q.isFavorite).length;
 
     // En güçlü ve gelişime açık dersler
@@ -2447,6 +2846,7 @@ export default function App() {
       temelCorrect,
       temelAccuracy,
       wrongBookCount,
+      dueReviewCount,
       favoriteCount,
       perSubject,
       strongestSubject,
@@ -4088,6 +4488,20 @@ export default function App() {
                 </button>
 
                 <button
+                  onClick={() => setNotebookFilterType('due')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+                    notebookFilterType === 'due'
+                      ? 'bg-violet-600 border-violet-600 text-white'
+                      : darkMode
+                      ? 'border-slate-700 text-slate-300'
+                      : 'border-slate-200 text-slate-700'
+                  }`}
+                  title="Aralıklı tekrar: yanlış yapılan sorular 1, 3, 7 ve 21 gün sonra tekrar sorulur"
+                >
+                  Bugün Tekrar ({analyticsData.dueReviewCount})
+                </button>
+
+                <button
                   onClick={() => setNotebookFilterType('wrong')}
                   className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
                     notebookFilterType === 'wrong'
@@ -4179,6 +4593,18 @@ export default function App() {
                               Yanlış Defteri {q.lastUserAnswer ? `(Son İşaret: ${q.lastUserAnswer})` : ''}
                             </span>
                           )}
+                          {q.isWrongPreviously && (
+                            <span
+                              className={`px-2.5 py-1 rounded-md text-xs font-bold ${
+                                isReviewDue(q)
+                                  ? 'bg-violet-600 text-white'
+                                  : 'bg-violet-500/15 text-violet-700 dark:text-violet-300'
+                              }`}
+                              title="Aralıklı tekrar: 1, 3, 7 ve 21 gün sonraki tekrarların hepsini doğru yapınca soru defterden çıkar"
+                            >
+                              {describeNextReview(q)} · {Math.min(q.reviewStage || 0, REVIEW_INTERVAL_DAYS.length)}/{REVIEW_INTERVAL_DAYS.length}
+                            </span>
+                          )}
                           {q.isFavorite && (
                             <span className="px-2.5 py-1 rounded-md text-xs font-bold bg-amber-500/15 text-amber-600 dark:text-amber-400">
                               ★ Favori
@@ -4204,7 +4630,9 @@ export default function App() {
                               onClick={() =>
                                 setQuestionBank((prev) =>
                                   prev.map((item) =>
-                                    item.id === q.id ? { ...item, isWrongPreviously: false } : item
+                                    item.id === q.id
+                                      ? { ...item, isWrongPreviously: false, reviewStage: undefined, nextReviewAt: undefined }
+                                      : item
                                   )
                                 )
                               }
@@ -4581,11 +5009,15 @@ export default function App() {
             >
               <div className="relative">
                 <BookmarkCheck className="w-5 h-5" />
-                {analyticsData.wrongBookCount + analyticsData.favoriteCount > 0 && (
+                {analyticsData.dueReviewCount > 0 ? (
+                  <span className="absolute -top-1.5 -right-2.5 min-w-[16px] h-4 px-1 rounded-full bg-rose-600 text-white text-[10px] font-bold flex items-center justify-center">
+                    {analyticsData.dueReviewCount}
+                  </span>
+                ) : analyticsData.wrongBookCount + analyticsData.favoriteCount > 0 ? (
                   <span className="absolute -top-1.5 -right-2.5 min-w-[16px] h-4 px-1 rounded-full bg-teal-600 text-white text-[10px] font-bold flex items-center justify-center">
                     {analyticsData.wrongBookCount + analyticsData.favoriteCount}
                   </span>
-                )}
+                ) : null}
               </div>
               <span>Defterim</span>
             </button>
