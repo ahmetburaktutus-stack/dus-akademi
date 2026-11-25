@@ -24,6 +24,9 @@ jobs:
           distribution: temurin
           java-version: 21
 
+      # Android/Gradle bağımlılıklarını derlemeler arasında saklar (daha hızlı, daha az indirme)
+      - uses: gradle/actions/setup-gradle@v4
+
       - name: Bağımlılıkları kur ve web uygulamasını derle
         run: |
           npm ci
@@ -34,7 +37,13 @@ jobs:
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          # Maven sunucusu geçici "429 Too Many Requests" verirse 3 kez yeniden dene
+          for attempt in 1 2 3; do
+            ./gradlew assembleDebug --no-daemon && break
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            echo "Derleme başarısız, $((attempt * 30)) sn sonra tekrar deneniyor..."
+            sleep $((attempt * 30))
+          done
           cp app/build/outputs/apk/debug/app-debug.apk ../DUS-Akademi.apk
 
       - name: APK'yı yükle
